@@ -8,5 +8,5 @@ Route::prefix(config('statamic-sync.route_prefix', '_sync'))
     ->middleware(VerifySyncToken::class)
     ->group(function () {
         Route::get('manifest', [SyncController::class, 'manifest']);
-        Route::get('file', [SyncController::class, 'file']);
+        Route::get('archive', [SyncController::class, 'archive']);
     });

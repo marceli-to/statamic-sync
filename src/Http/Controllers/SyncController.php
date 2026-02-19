@@ -4,7 +4,7 @@ namespace MarceliTo\StatamicSync\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class SyncController extends Controller
 {
@@ -35,45 +35,50 @@ class SyncController extends Controller
     }
 
     /**
-     * Download a single file.
+     * Stream a tar.gz of a single path directly to the response.
      *
-     * GET /_sync/file?path=content/collections/pages/home.yaml
-     * GET /_sync/file?path=assets/images/photo.jpg
+     * GET /_sync/archive?path=content
+     * GET /_sync/archive?path=assets
      */
-    public function file(Request $request): BinaryFileResponse
+    public function archive(Request $request): StreamedResponse
     {
-        $requestedPath = $request->query('path', '');
+        set_time_limit(0);
 
-        if (empty($requestedPath)) {
-            abort(400, 'No path specified.');
+        $key = $request->query('path', '');
+        $configuredPaths = config('statamic-sync.paths', []);
+
+        if (empty($key) || ! isset($configuredPaths[$key])) {
+            abort(400, 'Invalid path key.');
         }
 
-        // Determine which configured path this belongs to
-        $configuredPaths = config('statamic-sync.paths', []);
-        $resolvedPath = null;
+        $fullPath = realpath(base_path($configuredPaths[$key]));
 
-        foreach ($configuredPaths as $key => $basePath) {
-            if (str_starts_with($requestedPath, $key . '/')) {
-                $relativePath = substr($requestedPath, strlen($key) + 1);
-                $candidate = base_path($basePath . '/' . $relativePath);
+        if (! $fullPath || ! is_dir($fullPath)) {
+            abort(404, 'Path not found.');
+        }
 
-                // Prevent directory traversal
-                $realBase = realpath(base_path($basePath));
-                $realCandidate = realpath($candidate);
+        return new StreamedResponse(function () use ($fullPath) {
+            // Stream tar.gz directly to output — nothing written to disk
+            $cmd = sprintf(
+                'tar czf - -C %s .',
+                escapeshellarg($fullPath)
+            );
 
-                if ($realCandidate && $realBase && str_starts_with($realCandidate, $realBase) && is_file($realCandidate)) {
-                    $resolvedPath = $realCandidate;
+            $process = popen($cmd, 'r');
+
+            if ($process) {
+                while (! feof($process)) {
+                    echo fread($process, 2 * 1024 * 1024);
+                    flush();
                 }
 
-                break;
+                pclose($process);
             }
-        }
-
-        if (! $resolvedPath) {
-            abort(404, 'File not found.');
-        }
-
-        return response()->file($resolvedPath);
+        }, 200, [
+            'Content-Type' => 'application/gzip',
+            'Content-Disposition' => "attachment; filename=\"{$key}.tar.gz\"",
+            'X-Accel-Buffering' => 'no',
+        ]);
     }
 
     private function buildManifest(string $directory): array
