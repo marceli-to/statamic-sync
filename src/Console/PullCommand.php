@@ -3,7 +3,6 @@
 namespace MarceliTo\StatamicSync\Console;
 
 use Illuminate\Console\Command;
-use ZipArchive;
 
 class PullCommand extends Command
 {
@@ -31,145 +30,121 @@ class PullCommand extends Command
 
         $paths = $this->option('only') ?: 'content,assets';
 
-        // Dry run — fetch manifest and show file counts
+        // Fetch manifest
+        $this->info("Fetching file list from {$remote}...");
+        $manifest = $this->fetchManifest($remote, $token, $paths);
+
+        if ($manifest === null) {
+            return self::FAILURE;
+        }
+
+        // Show summary
+        $totalFiles = 0;
+        $totalSize = 0;
+
+        foreach ($manifest as $key => $files) {
+            $keySize = array_sum(array_column($files, 'size'));
+            $totalFiles += count($files);
+            $totalSize += $keySize;
+            $this->line("  <info>{$key}</info>: " . count($files) . ' files (' . $this->formatBytes($keySize) . ')');
+        }
+
+        $this->line("  <comment>Total</comment>: {$totalFiles} files (" . $this->formatBytes($totalSize) . ')');
+
         if ($this->option('dry-run')) {
-            return $this->dryRun($remote, $token, $paths);
+            return self::SUCCESS;
         }
 
         // Confirmation
-        if (! $this->option('force') && ! $this->confirm("This will overwrite local [{$paths}] with remote data. Continue?")) {
+        if (! $this->option('force') && ! $this->confirm('This will overwrite local files with remote data. Continue?')) {
             $this->info('Cancelled.');
             return self::SUCCESS;
         }
 
-        // If pulling both content and assets, do them separately to avoid timeout
-        $keys = array_map('trim', explode(',', $paths));
+        $configuredPaths = config('statamic-sync.paths', []);
 
-        foreach ($keys as $key) {
-            $result = $this->pullPath($remote, $token, $key);
+        // Clean target directories
+        $requestedKeys = array_keys($manifest);
 
-            if ($result !== self::SUCCESS) {
-                return $result;
+        foreach ($requestedKeys as $key) {
+            if (! isset($configuredPaths[$key])) {
+                continue;
+            }
+
+            $targetDir = base_path($configuredPaths[$key]);
+
+            if (is_dir($targetDir)) {
+                $this->output->write("  Cleaning {$key}... ");
+                $this->deleteDirectory($targetDir);
+                $this->line('✓');
+            }
+
+            mkdir($targetDir, 0755, true);
+        }
+
+        // Download files one by one
+        $this->newLine();
+        $bar = $this->output->createProgressBar($totalFiles);
+        $bar->setFormat(" %current%/%max% [%bar%] %percent:3s%% %message%");
+        $bar->setMessage('Starting...');
+        $bar->start();
+
+        $errors = [];
+
+        foreach ($manifest as $key => $files) {
+            if (! isset($configuredPaths[$key])) {
+                continue;
+            }
+
+            $targetDir = base_path($configuredPaths[$key]);
+
+            foreach ($files as $relativePath => $meta) {
+                $bar->setMessage($key . '/' . $this->truncatePath($relativePath, 40));
+
+                $remotePath = $key . '/' . $relativePath;
+                $localPath = $targetDir . '/' . $relativePath;
+
+                // Ensure directory exists
+                $dir = dirname($localPath);
+
+                if (! is_dir($dir)) {
+                    mkdir($dir, 0755, true);
+                }
+
+                // Download file
+                $success = $this->downloadFile($remote, $token, $remotePath, $localPath);
+
+                if (! $success) {
+                    $errors[] = $remotePath;
+                }
+
+                $bar->advance();
             }
         }
 
-        $this->newLine();
+        $bar->setMessage('Done!');
+        $bar->finish();
+        $this->newLine(2);
+
+        if (! empty($errors)) {
+            $this->warn(count($errors) . ' file(s) failed to download:');
+
+            foreach (array_slice($errors, 0, 10) as $path) {
+                $this->line("  - {$path}");
+            }
+
+            if (count($errors) > 10) {
+                $this->line('  ... and ' . (count($errors) - 10) . ' more');
+            }
+        }
+
         $this->info('✓ Sync complete.');
 
         return self::SUCCESS;
     }
 
-    private function pullPath(string $remote, string $token, string $key): int
+    private function fetchManifest(string $remote, string $token, string $paths): ?array
     {
-        $this->info("Pulling [{$key}] from {$remote}...");
-
-        // Use cURL for streaming download with progress
-        $tempFile = tempnam(sys_get_temp_dir(), 'statamic-sync-') . '.zip';
-        $fp = fopen($tempFile, 'w+');
-
-        $ch = curl_init("{$remote}/_sync/download?" . http_build_query(['paths' => $key]));
-        curl_setopt_array($ch, [
-            CURLOPT_HTTPHEADER => ["Authorization: Bearer {$token}"],
-            CURLOPT_FILE => $fp,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT => 0, // No timeout
-            CURLOPT_CONNECTTIMEOUT => 30,
-            CURLOPT_BUFFERSIZE => 2 * 1024 * 1024,
-            CURLOPT_NOPROGRESS => false,
-            CURLOPT_PROGRESSFUNCTION => function ($ch, $dlTotal, $dlNow) {
-                if ($dlTotal > 0) {
-                    $pct = round(($dlNow / $dlTotal) * 100);
-                    $downloaded = $this->formatBytes((int) $dlNow);
-                    $total = $this->formatBytes((int) $dlTotal);
-                    $this->output->write("\r  Downloading: {$downloaded} / {$total} ({$pct}%)");
-                }
-
-                return 0;
-            },
-        ]);
-
-        $success = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
-        fclose($fp);
-
-        $this->newLine();
-
-        if (! $success || $httpCode !== 200) {
-            $body = file_get_contents($tempFile);
-            @unlink($tempFile);
-            $this->error("  Failed: HTTP {$httpCode}" . ($error ? " ({$error})" : ''));
-            return self::FAILURE;
-        }
-
-        // Extract
-        $this->output->write('  Extracting... ');
-
-        $zip = new ZipArchive();
-
-        if ($zip->open($tempFile) !== true) {
-            $this->error('Failed to open downloaded archive.');
-            @unlink($tempFile);
-            return self::FAILURE;
-        }
-
-        $configuredPaths = config('statamic-sync.paths', []);
-
-        if (! isset($configuredPaths[$key])) {
-            $this->error("Unknown path key: {$key}");
-            $zip->close();
-            @unlink($tempFile);
-            return self::FAILURE;
-        }
-
-        $targetDir = base_path($configuredPaths[$key]);
-
-        // Clean the target directory
-        if (is_dir($targetDir)) {
-            $this->deleteDirectory($targetDir);
-        }
-
-        mkdir($targetDir, 0755, true);
-
-        // Extract files
-        for ($i = 0; $i < $zip->numFiles; $i++) {
-            $entryName = $zip->getNameIndex($i);
-
-            if (str_starts_with($entryName, $key . '/')) {
-                $relativePath = substr($entryName, strlen($key) + 1);
-
-                if (empty($relativePath)) {
-                    continue;
-                }
-
-                $targetPath = $targetDir . '/' . $relativePath;
-                $targetDirPath = dirname($targetPath);
-
-                if (! is_dir($targetDirPath)) {
-                    mkdir($targetDirPath, 0755, true);
-                }
-
-                $content = $zip->getFromIndex($i);
-
-                if ($content !== false) {
-                    file_put_contents($targetPath, $content);
-                }
-            }
-        }
-
-        $zip->close();
-        @unlink($tempFile);
-
-        $this->line('✓');
-
-        return self::SUCCESS;
-    }
-
-    private function dryRun(string $remote, string $token, string $paths): int
-    {
-        $this->info("Fetching manifest from {$remote}...");
-
         $ch = curl_init("{$remote}/_sync/manifest?" . http_build_query(['paths' => $paths]));
         curl_setopt_array($ch, [
             CURLOPT_HTTPHEADER => ["Authorization: Bearer {$token}"],
@@ -183,18 +158,38 @@ class PullCommand extends Command
         curl_close($ch);
 
         if ($httpCode !== 200) {
-            $this->error("Failed: HTTP {$httpCode} {$response}");
-            return self::FAILURE;
+            $this->error("Failed to fetch manifest: HTTP {$httpCode}");
+            return null;
         }
 
-        $manifest = json_decode($response, true);
+        return json_decode($response, true);
+    }
 
-        foreach ($manifest as $key => $files) {
-            $totalSize = array_sum(array_column($files, 'size'));
-            $this->line("  <info>{$key}</info>: " . count($files) . ' files (' . $this->formatBytes($totalSize) . ')');
+    private function downloadFile(string $remote, string $token, string $remotePath, string $localPath): bool
+    {
+        $url = "{$remote}/_sync/file?" . http_build_query(['path' => $remotePath]);
+
+        $fp = fopen($localPath, 'w');
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_HTTPHEADER => ["Authorization: Bearer {$token}"],
+            CURLOPT_FILE => $fp,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => 120,
+            CURLOPT_CONNECTTIMEOUT => 15,
+        ]);
+
+        $success = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        fclose($fp);
+
+        if (! $success || $httpCode !== 200) {
+            @unlink($localPath);
+            return false;
         }
 
-        return self::SUCCESS;
+        return true;
     }
 
     private function deleteDirectory(string $dir): void
@@ -213,6 +208,15 @@ class PullCommand extends Command
         }
 
         rmdir($dir);
+    }
+
+    private function truncatePath(string $path, int $max): string
+    {
+        if (strlen($path) <= $max) {
+            return $path;
+        }
+
+        return '...' . substr($path, -(max($max - 3, 10)));
     }
 
     private function formatBytes(int $bytes): string

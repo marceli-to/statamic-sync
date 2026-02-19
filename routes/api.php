@@ -7,6 +7,6 @@ use MarceliTo\StatamicSync\Http\Middleware\VerifySyncToken;
 Route::prefix(config('statamic-sync.route_prefix', '_sync'))
     ->middleware(VerifySyncToken::class)
     ->group(function () {
-        Route::get('download', [SyncController::class, 'download']);
         Route::get('manifest', [SyncController::class, 'manifest']);
+        Route::get('file', [SyncController::class, 'file']);
     });

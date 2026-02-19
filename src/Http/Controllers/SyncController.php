@@ -4,74 +4,10 @@ namespace MarceliTo\StatamicSync\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Symfony\Component\HttpFoundation\StreamedResponse;
-use ZipArchive;
+use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class SyncController extends Controller
 {
-    /**
-     * Stream a zip of the requested paths.
-     *
-     * GET /_sync/download?paths=content,assets
-     */
-    public function download(Request $request): StreamedResponse
-    {
-        // Disable time limit for large downloads
-        set_time_limit(0);
-
-        $requestedPaths = $request->query('paths', 'content,assets');
-        $keys = array_map('trim', explode(',', $requestedPaths));
-
-        $configuredPaths = config('statamic-sync.paths', []);
-        $pathsToZip = [];
-
-        foreach ($keys as $key) {
-            if (isset($configuredPaths[$key])) {
-                $fullPath = base_path($configuredPaths[$key]);
-
-                if (is_dir($fullPath)) {
-                    $pathsToZip[$key] = $fullPath;
-                }
-            }
-        }
-
-        if (empty($pathsToZip)) {
-            abort(404, 'No valid paths found to sync.');
-        }
-
-        // Build zip to temp file (streaming from disk, not memory)
-        $tempFile = tempnam(sys_get_temp_dir(), 'statamic-sync-') . '.zip';
-
-        $zip = new ZipArchive();
-        $zip->open($tempFile, ZipArchive::CREATE | ZipArchive::OVERWRITE);
-
-        foreach ($pathsToZip as $key => $fullPath) {
-            $this->addDirectoryToZip($zip, $fullPath, $key);
-        }
-
-        $zip->close();
-
-        $fileSize = filesize($tempFile);
-
-        return new StreamedResponse(function () use ($tempFile) {
-            $stream = fopen($tempFile, 'rb');
-
-            // Stream in 2MB chunks to avoid memory issues
-            while (! feof($stream)) {
-                echo fread($stream, 2 * 1024 * 1024);
-                flush();
-            }
-
-            fclose($stream);
-            @unlink($tempFile);
-        }, 200, [
-            'Content-Type' => 'application/zip',
-            'Content-Disposition' => 'attachment; filename="statamic-sync.zip"',
-            'Content-Length' => $fileSize,
-            'X-Accel-Buffering' => 'no', // Disable nginx buffering
-        ]);
-    }
-
     /**
      * Return a manifest of files with their sizes and hashes.
      *
@@ -98,19 +34,46 @@ class SyncController extends Controller
         return $manifest;
     }
 
-    private function addDirectoryToZip(ZipArchive $zip, string $directory, string $prefix): void
+    /**
+     * Download a single file.
+     *
+     * GET /_sync/file?path=content/collections/pages/home.yaml
+     * GET /_sync/file?path=assets/images/photo.jpg
+     */
+    public function file(Request $request): BinaryFileResponse
     {
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::LEAVES_ONLY
-        );
+        $requestedPath = $request->query('path', '');
 
-        foreach ($iterator as $file) {
-            if ($file->isFile()) {
-                $relativePath = $prefix . '/' . substr($file->getPathname(), strlen($directory) + 1);
-                $zip->addFile($file->getPathname(), $relativePath);
+        if (empty($requestedPath)) {
+            abort(400, 'No path specified.');
+        }
+
+        // Determine which configured path this belongs to
+        $configuredPaths = config('statamic-sync.paths', []);
+        $resolvedPath = null;
+
+        foreach ($configuredPaths as $key => $basePath) {
+            if (str_starts_with($requestedPath, $key . '/')) {
+                $relativePath = substr($requestedPath, strlen($key) + 1);
+                $candidate = base_path($basePath . '/' . $relativePath);
+
+                // Prevent directory traversal
+                $realBase = realpath(base_path($basePath));
+                $realCandidate = realpath($candidate);
+
+                if ($realCandidate && $realBase && str_starts_with($realCandidate, $realBase) && is_file($realCandidate)) {
+                    $resolvedPath = $realCandidate;
+                }
+
+                break;
             }
         }
+
+        if (! $resolvedPath) {
+            abort(404, 'File not found.');
+        }
+
+        return response()->file($resolvedPath);
     }
 
     private function buildManifest(string $directory): array
