@@ -5,10 +5,11 @@ Pull Statamic content and assets from a remote environment to your local setup �
 ## How It Works
 
 1. The package exposes a protected endpoint on your remote site
-2. When you run `statamic:pull`, it streams a compressed tar.gz archive directly from the server — nothing is written to disk on production
-3. Locally, the archive is extracted and your content/assets are replaced
+2. When you run `statamic:pull`, it compares local and remote files via hash manifests
+3. Only new, changed, and deleted files are synced — unchanged files are skipped
+4. Files are streamed as compressed tar.gz archives directly from the server
 
-Only 2 HTTP requests total (one per path), regardless of how many files you have.
+First run downloads everything. Subsequent runs only sync the diff.
 
 ## Requirements
 
@@ -72,10 +73,32 @@ php artisan statamic:pull --only=content
 php artisan statamic:pull --only=assets
 ```
 
-### Dry run (see what would be synced)
+### Dry run (see what would change)
 
 ```bash
 php artisan statamic:pull --dry-run
+```
+
+Output shows exactly what would happen:
+
+```
+content:
+  Unchanged: 52 files
+  Changed:   3 files
+  New:       2 files
+  Deleted:   1 files
+  Download:  12.5 KB
+
+assets:
+  Unchanged: 820 files
+  New:       3 files
+  Download:  4.2 MB
+```
+
+### Force full sync (skip delta comparison)
+
+```bash
+php artisan statamic:pull --full
 ```
 
 ### Skip confirmation
@@ -126,6 +149,7 @@ Remember to update on **both** local and remote when upgrading.
 - Optional IP whitelisting for additional protection
 - Use a strong, unique token — `openssl rand -hex 32`
 - The sync endpoints are only accessible with a valid token
+- Directory traversal protection on file serving
 
 ## License
 
