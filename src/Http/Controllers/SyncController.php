@@ -16,6 +16,9 @@ class SyncController extends Controller
      */
     public function download(Request $request): StreamedResponse
     {
+        // Disable time limit for large downloads
+        set_time_limit(0);
+
         $requestedPaths = $request->query('paths', 'content,assets');
         $keys = array_map('trim', explode(',', $requestedPaths));
 
@@ -36,6 +39,7 @@ class SyncController extends Controller
             abort(404, 'No valid paths found to sync.');
         }
 
+        // Build zip to temp file (streaming from disk, not memory)
         $tempFile = tempnam(sys_get_temp_dir(), 'statamic-sync-') . '.zip';
 
         $zip = new ZipArchive();
@@ -47,13 +51,24 @@ class SyncController extends Controller
 
         $zip->close();
 
-        return response()->streamDownload(function () use ($tempFile) {
+        $fileSize = filesize($tempFile);
+
+        return new StreamedResponse(function () use ($tempFile) {
             $stream = fopen($tempFile, 'rb');
-            fpassthru($stream);
+
+            // Stream in 2MB chunks to avoid memory issues
+            while (! feof($stream)) {
+                echo fread($stream, 2 * 1024 * 1024);
+                flush();
+            }
+
             fclose($stream);
             @unlink($tempFile);
-        }, 'statamic-sync.zip', [
+        }, 200, [
             'Content-Type' => 'application/zip',
+            'Content-Disposition' => 'attachment; filename="statamic-sync.zip"',
+            'Content-Length' => $fileSize,
+            'X-Accel-Buffering' => 'no', // Disable nginx buffering
         ]);
     }
 
