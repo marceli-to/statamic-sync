@@ -14,7 +14,7 @@ First run downloads everything. Subsequent runs only sync the diff.
 ## Requirements
 
 - PHP 8.1+
-- Laravel 10, 11, or 12
+- Laravel 10, 11, 12, or 13
 - `tar` available on both server and local machine (standard on Linux/macOS)
 
 ## Installation
